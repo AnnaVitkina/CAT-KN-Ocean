@@ -545,13 +545,16 @@ def collect_main_uids(df: pd.DataFrame) -> set[str]:
     return uids
 
 
-def lane_involves_gb(row: pd.Series) -> bool:
-    """True when Origin Country or Destination Country is GB."""
+PRIORITY_COUNTRIES = frozenset({"GB", "ZA"})
+
+
+def lane_involves_priority_country(row: pd.Series) -> bool:
+    """True when Origin or Destination country is GB or ZA."""
     origin = row.get("Origin Country")
     dest = row.get("Destination Country")
     origin_code = str(origin).strip().upper() if pd.notna(origin) else ""
     dest_code = str(dest).strip().upper() if pd.notna(dest) else ""
-    return origin_code == "GB" or dest_code == "GB"
+    return origin_code in PRIORITY_COUNTRIES or dest_code in PRIORITY_COUNTRIES
 
 
 def extract_missing_baf_lanes(
@@ -559,14 +562,14 @@ def extract_missing_baf_lanes(
     missing_uids: set[str],
     uid_source: dict[str, str],
     *,
-    gb_only: bool | None = True,
+    priority_only: bool | None = True,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     One representative BAF-file row per missing UID (earliest Eff Date).
 
-    gb_only:
-      True  -> only Origin/Destination country GB
-      False -> only non-GB
+    priority_only:
+      True  -> only Origin/Destination country in {GB, ZA}
+      False -> only lanes that are neither GB nor ZA
       None  -> all missing UIDs
     """
     if not missing_uids or baf_df is None or baf_df.empty:
@@ -582,10 +585,10 @@ def extract_missing_baf_lanes(
         work = work.sort_values("Line Item Eff Date", kind="mergesort")
     work = work.drop_duplicates(subset=["_uid"], keep="first")
 
-    if gb_only is True:
-        work = work[work.apply(lane_involves_gb, axis=1)]
-    elif gb_only is False:
-        work = work[~work.apply(lane_involves_gb, axis=1)]
+    if priority_only is True:
+        work = work[work.apply(lane_involves_priority_country, axis=1)]
+    elif priority_only is False:
+        work = work[~work.apply(lane_involves_priority_country, axis=1)]
 
     if work.empty:
         return pd.DataFrame(), []
@@ -1356,6 +1359,320 @@ def build_accessorial_blocks(main_rates_path: Path) -> list[dict]:
     return blocks
 
 
+def _find_ffw_sheet_name(sheet_names: list[str]) -> str | None:
+    for name in sheet_names:
+        if str(name).strip().casefold() == "ffw":
+            return name
+    for name in sheet_names:
+        if "ffw" in str(name).strip().casefold():
+            return name
+    return None
+
+
+def _ffw_col(df: pd.DataFrame, *candidates: str) -> str | None:
+    """Match FFW columns allowing leading * and spacing differences."""
+    normalized = {
+        " ".join(str(c).lstrip("*").strip().split()).casefold(): c for c in df.columns
+    }
+    for cand in candidates:
+        key = " ".join(cand.lstrip("*").strip().split()).casefold()
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def _ffw_cell(value) -> str | None:
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _ffw_is_all_regions(value) -> bool:
+    text = _ffw_cell(value)
+    if not text:
+        return False
+    return text.casefold() in {"all regions", "all region"}
+
+
+def _ffw_numeric_price(value):
+    """Return numeric price, or None when missing / not a number."""
+    if pd.isna(value):
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return visible_number(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if not re.fullmatch(r"-?\d+(?:[.,]\d+)?", text.replace(" ", "")):
+        return None
+    return visible_number(text.replace(",", ""))
+
+
+# Country name / alias -> ISO 3166-1 alpha-2 (FFW + common variants)
+_COUNTRY_TO_ISO: dict[str, str] = {
+    "afghanistan": "AF",
+    "australia": "AU",
+    "austria": "AT",
+    "belgium": "BE",
+    "brazil": "BR",
+    "canada": "CA",
+    "china": "CN",
+    "czech republic": "CZ",
+    "czechia": "CZ",
+    "denmark": "DK",
+    "finland": "FI",
+    "france": "FR",
+    "germany": "DE",
+    "great britain": "GB",
+    "hong kong": "HK",
+    "hungary": "HU",
+    "india": "IN",
+    "indonesia": "ID",
+    "ireland": "IE",
+    "italy": "IT",
+    "japan": "JP",
+    "korea": "KR",
+    "south korea": "KR",
+    "republic of korea": "KR",
+    "luxembourg": "LU",
+    "malaysia": "MY",
+    "mexico": "MX",
+    "netherlands": "NL",
+    "the netherlands": "NL",
+    "new zealand": "NZ",
+    "norway": "NO",
+    "philippines": "PH",
+    "poland": "PL",
+    "portugal": "PT",
+    "russia": "RU",
+    "russian federation": "RU",
+    "singapore": "SG",
+    "south africa": "ZA",
+    "spain": "ES",
+    "sweden": "SE",
+    "switzerland": "CH",
+    "taiwan": "TW",
+    "thailand": "TH",
+    "turkey": "TR",
+    "türkiye": "TR",
+    "turkiye": "TR",
+    "ukraine": "UA",
+    "united kingdom": "GB",
+    "uk": "GB",
+    "gb": "GB",
+    "united states": "US",
+    "united states of america": "US",
+    "usa": "US",
+    "us": "US",
+    "vietnam": "VN",
+    "viet nam": "VN",
+    "au": "AU",
+    "cn": "CN",
+    "de": "DE",
+    "jp": "JP",
+}
+
+
+def _ffw_to_iso_country(value) -> str | None:
+    """
+    Map a country name to ISO code.
+    Blank for All Regions. Leave non-country regions (EAME, APAC, ...) unchanged.
+    """
+    text = _ffw_cell(value)
+    if not text or _ffw_is_all_regions(text):
+        return None
+    key = " ".join(text.casefold().split())
+    if key in _COUNTRY_TO_ISO:
+        return _COUNTRY_TO_ISO[key]
+    if len(text) == 2 and text.isalpha():
+        return text.upper()
+    return text
+
+
+def _ffw_apply_if_value(value, *, map_country: bool) -> str | None:
+    """Blank All Regions; optionally map countries to ISO."""
+    if _ffw_is_all_regions(value):
+        return None
+    if map_country:
+        return _ffw_to_iso_country(value)
+    return _ffw_cell(value)
+
+
+def build_accessorial_other_rows(main_rates_path: Path) -> list[list]:
+    """
+    Build Accessorial Costs (other) rows from the FFW sheet.
+
+    Columns:
+      cost name | currency | price | rate by | Origin Country | Origin Location | Destination Location
+    (last three under Applies if)
+
+    Skips non-numeric prices. Blanks All Regions. Maps countries to ISO codes.
+    """
+    frames = pd.read_excel(main_rates_path, sheet_name=None, engine="openpyxl")
+    sheet_name = _find_ffw_sheet_name(list(frames.keys()))
+    if sheet_name is None:
+        print("  Accessorial Costs (other): FFW sheet not found — skipped")
+        return []
+
+    df = frames[sheet_name].copy()
+    df.columns = [" ".join(str(c).strip().split()) for c in df.columns]
+
+    col_cost = _ffw_col(df, "Service Charge Code")
+    col_currency = _ffw_col(df, "Currency")
+    col_price = _ffw_col(df, "Rate")
+    col_rate_by = _ffw_col(df, "Rating Unit")
+    col_orig_country = _ffw_col(df, "Origin Country Name")
+    col_orig_loc = _ffw_col(df, "Origin Location Name")
+    col_dest_loc = _ffw_col(df, "Destination Location Name")
+
+    missing = [
+        label
+        for label, col in [
+            ("Service Charge Code", col_cost),
+            ("Currency", col_currency),
+            ("Rate", col_price),
+            ("Rating Unit", col_rate_by),
+            ("Origin Country Name", col_orig_country),
+            ("Origin Location Name", col_orig_loc),
+            ("Destination Location Name", col_dest_loc),
+        ]
+        if col is None
+    ]
+    if missing:
+        print(
+            "  Accessorial Costs (other): FFW missing columns "
+            f"{missing} — skipped"
+        )
+        return []
+
+    rows: list[list] = []
+    seen: set[tuple] = set()
+    skipped_non_numeric = 0
+    for _, row in df.iterrows():
+        cost_name = _ffw_cell(row.get(col_cost))
+        if not cost_name:
+            continue
+        price = _ffw_numeric_price(row.get(col_price))
+        if price is None:
+            skipped_non_numeric += 1
+            continue
+
+        currency = _ffw_cell(row.get(col_currency))
+        rate_by = _ffw_cell(row.get(col_rate_by))
+        origin_country = _ffw_apply_if_value(
+            row.get(col_orig_country), map_country=True
+        )
+        origin_location = _ffw_apply_if_value(
+            row.get(col_orig_loc), map_country=False
+        )
+        dest_location = _ffw_apply_if_value(
+            row.get(col_dest_loc), map_country=True
+        )
+
+        key = (
+            cost_name,
+            currency,
+            price,
+            rate_by,
+            origin_country,
+            origin_location,
+            dest_location,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            [
+                cost_name,
+                currency,
+                price,
+                rate_by,
+                origin_country,
+                origin_location,
+                dest_location,
+            ]
+        )
+
+    # Keep same cost names together (stable by first appearance order of each name)
+    name_order: dict[str, int] = {}
+    for row in rows:
+        key = str(row[0]).casefold()
+        if key not in name_order:
+            name_order[key] = len(name_order)
+    rows.sort(key=lambda r: (name_order[str(r[0]).casefold()], str(r[0]).casefold()))
+
+    extra = f", skipped {skipped_non_numeric} non-numeric price" if skipped_non_numeric else ""
+    print(
+        f"  Accessorial Costs (other): {len(rows)} FFW rows from '{sheet_name}'{extra}"
+    )
+    return rows
+
+
+def write_accessorial_other_sheet(ws, rows: list[list]) -> None:
+    """
+    Accessorial Costs (other) layout:
+      row1: cost name | currency | price | rate by | Applies if (merged x3)
+      row2: (blank x4) | Origin Country Name | Origin Location Name | Destination Location Name
+      row3+: data
+    """
+    header_font = Font(bold=True)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    header_fill = PatternFill("solid", fgColor="D9D9D9")
+    thin = Side(style="thin", color="B0B0B0")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def style_header(cell):
+        cell.font = header_font
+        cell.alignment = center
+        cell.fill = header_fill
+        cell.border = border
+
+    fixed = ["cost name", "currency", "price", "rate by"]
+    applies_subs = [
+        "Origin Country Name",
+        "Origin Location Name",
+        "Destination Location Name",
+    ]
+
+    for col_idx, name in enumerate(fixed, start=1):
+        style_header(ws.cell(row=1, column=col_idx, value=name))
+        ws.merge_cells(
+            start_row=1, start_column=col_idx, end_row=2, end_column=col_idx
+        )
+        style_header(ws.cell(row=1, column=col_idx))
+
+    applies_start = len(fixed) + 1
+    applies_end = applies_start + len(applies_subs) - 1
+    style_header(ws.cell(row=1, column=applies_start, value="Applies if"))
+    for i in range(1, len(applies_subs)):
+        style_header(ws.cell(row=1, column=applies_start + i, value=None))
+    ws.merge_cells(
+        start_row=1,
+        start_column=applies_start,
+        end_row=1,
+        end_column=applies_end,
+    )
+    style_header(ws.cell(row=1, column=applies_start))
+
+    for i, name in enumerate(applies_subs):
+        style_header(ws.cell(row=2, column=applies_start + i, value=name))
+
+    for r_i, row_vals in enumerate(rows):
+        excel_row = 3 + r_i
+        for c_i, value in enumerate(row_vals):
+            ws.cell(
+                row=excel_row,
+                column=1 + c_i,
+                value=_excel_value(value),
+            )
+
+    ws.row_dimensions[1].height = 22
+    ws.row_dimensions[2].height = 30
+    _autosize(ws, applies_end)
+    ws.freeze_panes = "A3"
+
+
 def write_accessorial_sheet(ws, blocks: list[dict]) -> None:
     """
     Accessorial costs layout per cost block:
@@ -1455,6 +1772,7 @@ def write_result_matrix(
     missing_shipment_rows: list[list] | None = None,
     missing_cost_columns: list[dict] | None = None,
     accessorial_blocks: list[dict] | None = None,
+    accessorial_other_rows: list[list] | None = None,
 ) -> Path:
     """Write Result (+ optional BAF + Missing lanes + Accessorial costs)."""
     _sync_dirs()
@@ -1489,6 +1807,10 @@ def write_result_matrix(
     if accessorial_blocks:
         acc_ws = wb.create_sheet("Accessorial costs")
         write_accessorial_sheet(acc_ws, accessorial_blocks)
+
+    if accessorial_other_rows:
+        other_ws = wb.create_sheet("Accessorial Costs (other)")
+        write_accessorial_other_sheet(other_ws, accessorial_other_rows)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -1530,7 +1852,7 @@ def build_result_matrix(
     Flow:
       1) Load main rates
       2) Load all BAF files; find UIDs present in BAF but missing from main
-      3) GB missing lanes -> Result (green); other missing -> "Missing lanes" tab
+      3) GB/ZA missing lanes -> Result (green); other missing -> "Missing lanes" tab
       4) Build BAF tab with period costs ordered by validity + prolong
     """
     _sync_dirs()
@@ -1553,15 +1875,15 @@ def build_result_matrix(
         missing_uids = baf_uids - main_uids
         if missing_uids:
             gb_df, gb_cards = extract_missing_baf_lanes(
-                baf_df, missing_uids, uid_source, gb_only=True
+                baf_df, missing_uids, uid_source, priority_only=True
             )
             other_df, other_cards = extract_missing_baf_lanes(
-                baf_df, missing_uids, uid_source, gb_only=False
+                baf_df, missing_uids, uid_source, priority_only=False
             )
 
             if not gb_df.empty:
                 print(
-                    f"  Missing BAF UIDs with GB: {len(gb_df)} "
+                    f"  Missing BAF UIDs with GB/ZA: {len(gb_df)} "
                     "added to Result (green)"
                 )
                 combined_df, rate_cards, green_flags = merge_main_with_missing_baf(
@@ -1570,12 +1892,12 @@ def build_result_matrix(
             else:
                 print(
                     f"  Missing BAF UIDs: {len(missing_uids)} "
-                    "(none with GB — nothing added to Result)"
+                    "(none with GB/ZA — nothing added to Result)"
                 )
 
             if not other_df.empty:
                 print(
-                    f"  Missing BAF UIDs without GB: {len(other_df)} "
+                    f"  Missing BAF UIDs without GB/ZA: {len(other_df)} "
                     'written to "Missing lanes" tab'
                 )
                 missing_shipment_rows = build_shipment_rows_with_cards(
@@ -1588,6 +1910,7 @@ def build_result_matrix(
 
     baf_costs = build_baf_sheet_costs(shipment_rows, baf_df, main_df=main_df)
     accessorial_blocks = build_accessorial_blocks(main_rates_path)
+    accessorial_other_rows = build_accessorial_other_rows(main_rates_path)
 
     if output_path is None:
         output_path = result_output_path(main_rates_path, rate_card=card)
@@ -1604,6 +1927,7 @@ def build_result_matrix(
         missing_shipment_rows=missing_shipment_rows,
         missing_cost_columns=missing_cost_columns,
         accessorial_blocks=accessorial_blocks or None,
+        accessorial_other_rows=accessorial_other_rows or None,
     )
 
 
