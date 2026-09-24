@@ -548,13 +548,53 @@ def collect_main_uids(df: pd.DataFrame) -> set[str]:
 PRIORITY_COUNTRIES = frozenset({"GB", "ZA"})
 
 
+def _lane_country_codes(row: pd.Series) -> set[str]:
+    codes: set[str] = set()
+    for col in ("Origin Country", "Destination Country"):
+        value = row.get(col)
+        if pd.isna(value):
+            continue
+        code = str(value).strip().upper()
+        if code:
+            codes.add(code)
+    return codes
+
+
 def lane_involves_priority_country(row: pd.Series) -> bool:
     """True when Origin or Destination country is GB or ZA."""
-    origin = row.get("Origin Country")
-    dest = row.get("Destination Country")
-    origin_code = str(origin).strip().upper() if pd.notna(origin) else ""
-    dest_code = str(dest).strip().upper() if pd.notna(dest) else ""
-    return origin_code in PRIORITY_COUNTRIES or dest_code in PRIORITY_COUNTRIES
+    return bool(_lane_country_codes(row) & PRIORITY_COUNTRIES)
+
+
+def lane_involves_country(row: pd.Series, country: str) -> bool:
+    """True when Origin or Destination country matches `country`."""
+    return country.upper() in _lane_country_codes(row)
+
+
+def filter_lanes_by_country(
+    df: pd.DataFrame,
+    rate_cards: list[str],
+    green_flags: list[bool],
+    country: str,
+) -> tuple[pd.DataFrame, list[str], list[bool]]:
+    """Keep rows where origin or destination country is `country`."""
+    if df is None or df.empty:
+        return pd.DataFrame(), [], []
+
+    work = df.reset_index(drop=True)
+    mask = work.apply(lambda row: lane_involves_country(row, country), axis=1)
+    indexes = [i for i, keep in enumerate(mask.tolist()) if keep]
+    if not indexes:
+        return pd.DataFrame(), [], []
+
+    filtered = work.iloc[indexes].reset_index(drop=True)
+    cards = [
+        rate_cards[i] if i < len(rate_cards) else rate_cards[-1]
+        for i in indexes
+    ] if rate_cards else [""] * len(indexes)
+    flags = [
+        green_flags[i] if i < len(green_flags) else False for i in indexes
+    ]
+    return filtered, cards, flags
 
 
 def extract_missing_baf_lanes(
@@ -1763,29 +1803,57 @@ def write_accessorial_sheet(ws, blocks: list[dict]) -> None:
 
 
 def write_result_matrix(
-    shipment_rows: list[list],
-    cost_columns: list[dict],
     output_path: Path,
+    *,
+    gb_shipment_rows: list[list] | None = None,
+    gb_cost_columns: list[dict] | None = None,
+    gb_green_flags: list[bool] | None = None,
+    za_shipment_rows: list[list] | None = None,
+    za_cost_columns: list[dict] | None = None,
+    za_green_flags: list[bool] | None = None,
     baf_shipment_rows: list[list] | None = None,
     baf_cost_columns: list[dict] | None = None,
-    green_row_flags: list[bool] | None = None,
+    baf_green_flags: list[bool] | None = None,
     missing_shipment_rows: list[list] | None = None,
     missing_cost_columns: list[dict] | None = None,
     accessorial_blocks: list[dict] | None = None,
     accessorial_other_rows: list[list] | None = None,
 ) -> Path:
-    """Write Result (+ optional BAF + Missing lanes + Accessorial costs)."""
+    """Write Result GB / Result ZA (+ optional BAF + Missing + Accessorial)."""
     _sync_dirs()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Result"
-    write_matrix_sheet(
-        ws,
-        shipment_rows,
-        cost_columns,
-        green_row_flags=green_row_flags,
-    )
+
+    first_sheet = True
+
+    def add_result_sheet(
+        title: str,
+        shipment_rows: list[list] | None,
+        cost_columns: list[dict] | None,
+        green_flags: list[bool] | None,
+    ) -> None:
+        nonlocal first_sheet
+        if not shipment_rows or cost_columns is None:
+            return
+        if first_sheet:
+            ws = wb.active
+            ws.title = title
+            first_sheet = False
+        else:
+            ws = wb.create_sheet(title)
+        write_matrix_sheet(
+            ws,
+            shipment_rows,
+            cost_columns,
+            green_row_flags=green_flags,
+        )
+
+    add_result_sheet("Result GB", gb_shipment_rows, gb_cost_columns, gb_green_flags)
+    add_result_sheet("Result ZA", za_shipment_rows, za_cost_columns, za_green_flags)
+
+    if first_sheet:
+        # No GB/ZA lanes — keep an empty Result sheet
+        wb.active.title = "Result"
 
     if baf_shipment_rows is not None and baf_cost_columns is not None:
         baf_ws = wb.create_sheet("BAF")
@@ -1793,7 +1861,7 @@ def write_result_matrix(
             baf_ws,
             baf_shipment_rows,
             baf_cost_columns,
-            green_row_flags=green_row_flags,
+            green_row_flags=baf_green_flags,
         )
 
     if missing_shipment_rows and missing_cost_columns is not None:
@@ -1852,8 +1920,9 @@ def build_result_matrix(
     Flow:
       1) Load main rates
       2) Load all BAF files; find UIDs present in BAF but missing from main
-      3) GB/ZA missing lanes -> Result (green); other missing -> "Missing lanes" tab
-      4) Build BAF tab with period costs ordered by validity + prolong
+      3) GB/ZA missing lanes -> Result GB / Result ZA (green); other missing -> "Missing lanes"
+      4) Split Result into Result GB and Result ZA by origin/destination country
+      5) Build BAF tab with period costs ordered by validity + prolong
     """
     _sync_dirs()
     main_rates_path = Path(main_rates_path)
@@ -1874,20 +1943,20 @@ def build_result_matrix(
         baf_uids = collect_baf_uids(baf_df)
         missing_uids = baf_uids - main_uids
         if missing_uids:
-            gb_df, gb_cards = extract_missing_baf_lanes(
+            priority_df, priority_cards = extract_missing_baf_lanes(
                 baf_df, missing_uids, uid_source, priority_only=True
             )
             other_df, other_cards = extract_missing_baf_lanes(
                 baf_df, missing_uids, uid_source, priority_only=False
             )
 
-            if not gb_df.empty:
+            if not priority_df.empty:
                 print(
-                    f"  Missing BAF UIDs with GB/ZA: {len(gb_df)} "
+                    f"  Missing BAF UIDs with GB/ZA: {len(priority_df)} "
                     "added to Result (green)"
                 )
                 combined_df, rate_cards, green_flags = merge_main_with_missing_baf(
-                    main_df, card, gb_df, gb_cards
+                    main_df, card, priority_df, priority_cards
                 )
             else:
                 print(
@@ -1905,10 +1974,28 @@ def build_result_matrix(
                 )
                 missing_cost_columns = build_all_cost_columns(other_df)
 
-    shipment_rows = build_shipment_rows_with_cards(combined_df, rate_cards)
-    cost_columns = build_all_cost_columns(combined_df)
+    gb_df, gb_cards, gb_flags = filter_lanes_by_country(
+        combined_df, rate_cards, green_flags, "GB"
+    )
+    za_df, za_cards, za_flags = filter_lanes_by_country(
+        combined_df, rate_cards, green_flags, "ZA"
+    )
 
-    baf_costs = build_baf_sheet_costs(shipment_rows, baf_df, main_df=main_df)
+    gb_shipment_rows = (
+        build_shipment_rows_with_cards(gb_df, gb_cards) if not gb_df.empty else []
+    )
+    za_shipment_rows = (
+        build_shipment_rows_with_cards(za_df, za_cards) if not za_df.empty else []
+    )
+    gb_cost_columns = build_all_cost_columns(gb_df) if not gb_df.empty else []
+    za_cost_columns = build_all_cost_columns(za_df) if not za_df.empty else []
+
+    print(f"  Result GB: {len(gb_shipment_rows)} lanes")
+    print(f"  Result ZA: {len(za_shipment_rows)} lanes")
+
+    # BAF tab keeps the full combined lane set (GB + ZA + any others in main)
+    baf_shipment_rows = build_shipment_rows_with_cards(combined_df, rate_cards)
+    baf_costs = build_baf_sheet_costs(baf_shipment_rows, baf_df, main_df=main_df)
     accessorial_blocks = build_accessorial_blocks(main_rates_path)
     accessorial_other_rows = build_accessorial_other_rows(main_rates_path)
 
@@ -1918,12 +2005,16 @@ def build_result_matrix(
         output_path = Path(output_path)
 
     return write_result_matrix(
-        shipment_rows,
-        cost_columns,
         output_path,
-        baf_shipment_rows=shipment_rows if baf_costs else None,
+        gb_shipment_rows=gb_shipment_rows or None,
+        gb_cost_columns=gb_cost_columns or None,
+        gb_green_flags=gb_flags or None,
+        za_shipment_rows=za_shipment_rows or None,
+        za_cost_columns=za_cost_columns or None,
+        za_green_flags=za_flags or None,
+        baf_shipment_rows=baf_shipment_rows if baf_costs else None,
         baf_cost_columns=baf_costs if baf_costs else None,
-        green_row_flags=green_flags,
+        baf_green_flags=green_flags if baf_costs else None,
         missing_shipment_rows=missing_shipment_rows,
         missing_cost_columns=missing_cost_columns,
         accessorial_blocks=accessorial_blocks or None,
