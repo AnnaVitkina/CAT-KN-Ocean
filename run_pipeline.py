@@ -6,7 +6,7 @@ Steps:
      (BAF fee accepts multiple files)
   2) Convert chosen files -> processing/*_processed.xlsx
   3) Build result matrix:
-       - Result tab (main rates + missing BAF UIDs in green)
+       - Result GB / Result ZA tabs (by origin or destination country; missing BAF UIDs in green)
        - BAF tab (all BAF files, costs ordered by validity)
        - Missing lanes tab (non-GB missing BAF UIDs)
        - Accessorial costs tab
